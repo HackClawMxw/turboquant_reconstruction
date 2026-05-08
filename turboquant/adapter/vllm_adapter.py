@@ -295,7 +295,7 @@ class VllmAdapter(FrameworkAdapter):
     def free_kv_cache(self, model: Any) -> int:
         """Free paged KV cache for TQ-managed layers."""
         freed = 0
-        kv_caches = getattr(model, 'kv_cache', None) or []
+        kv_caches = getattr(model, 'kv_caches', None) or []
 
         for layer_name, state in self._layer_states.items():
             layer_idx = state.layer_info.layer_idx
@@ -692,8 +692,11 @@ def install_hooks(
     adapter = VllmAdapter(config)
     adapter.install_hooks(model_runner)
 
-    if no_alloc:
-        adapter.free_kv_cache(model_runner)
+    # NOTE: Do NOT call free_kv_cache here — at this point (during
+    # get_kv_cache_specs) the KV cache has not been allocated yet.
+    # The paged cache for the single target layer will remain allocated
+    # but unused; its memory cost is negligible compared to the N-1
+    # layers whose specs were removed by enable_no_alloc.
 
     return adapter
 
@@ -787,7 +790,7 @@ def enable_no_alloc(
 
         def _worker_install_tq(worker):
             from turboquant.adapter.vllm_adapter import install_hooks
-            install_hooks(
+            adapter = install_hooks(
                 worker.model_runner,
                 key_bits=cfg["key_bits"],
                 value_bits=cfg["value_bits"],
@@ -797,14 +800,55 @@ def enable_no_alloc(
                 no_alloc=True,
             )
 
+            # ── KV sharing: all TQ-managed layers share one paged cache ──
+            # This reduces KV cache allocation from N layers to 1.
+            # KV capture is done in patched forward, so skipping
+            # do_kv_cache_update for shared layers is safe.
+            static_ctx = worker.model_runner.static_forward_context
+            tq_layer_names = list(adapter._layer_states.keys())
+            shared_layer_names = []
+
+            if len(tq_layer_names) > 1:
+                target = tq_layer_names[0]
+                target_attn = static_ctx.get(target)
+                if target_attn is not None and hasattr(
+                    target_attn, "kv_sharing_target_layer_name"
+                ):
+                    target_attn.kv_sharing_target_layer_name = None
+                for name in tq_layer_names[1:]:
+                    attn = static_ctx.get(name)
+                    if attn is not None and hasattr(
+                        attn, "kv_sharing_target_layer_name"
+                    ):
+                        attn.kv_sharing_target_layer_name = target
+                        shared_layer_names.append(name)
+
+            return {"shared_layer_names": shared_layer_names}
+
         try:
-            self.collective_rpc(_worker_install_tq)
-            logger.info("[TurboQuant] no_alloc hooks installed via collective_rpc")
+            hooks = self.collective_rpc(_worker_install_tq)
+            logger.info("[TurboQuant] no_alloc hooks installed: %s", hooks)
         except Exception as e:
             logger.error("[TurboQuant] collective_rpc FAILED: %s", e, exc_info=True)
             return orig_get_specs(self)
 
-        return orig_get_specs(self)
+        specs = orig_get_specs(self)
+
+        # Remove specs for shared layers so vLLM doesn't allocate KV cache
+        # for them — they'll share the target layer's paged cache instead.
+        shared = []
+        if hooks and isinstance(hooks, list) and len(hooks) > 0:
+            shared = hooks[0].get("shared_layer_names", [])
+        for worker_specs in specs:
+            for name in shared:
+                worker_specs.pop(name, None)
+        if shared:
+            logger.info(
+                "[TurboQuant] Removed %d shared layer specs from KV cache "
+                "allocation (layers share one paged cache)", len(shared),
+            )
+
+        return specs
 
     Executor.get_kv_cache_specs = patched_get_kv_cache_specs
     Executor._tq_patched = True
