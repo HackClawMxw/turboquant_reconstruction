@@ -454,23 +454,27 @@ def _handle_prefill(
     Uses KVCaptureEngine.ingest_prefill which splits tokens:
     compress all but the last ring_capacity tokens, keep recent in ring buffer.
 
-    IMPORTANT: Resets the state before loading new prefill data to prevent
-    KV pollution from previous requests.
+    When the state has been used for decode (_entered_decode flag), a new
+    prefill means a fresh request is starting. Reset the state to prevent
+    KV pollution from the previous request.
     """
     num_tokens = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
 
     request_id = "prefill_current"
     state = vllm_state.get_state(request_id)
-    if state is not None:
-        # Previous request's state exists — must reset to avoid KV pollution.
+    if state is not None and getattr(state, '_entered_decode', False):
+        # Previous request went through decode → this is a new request.
+        # Reset to clear stale KV data. Safe because if other requests
+        # are concurrently decoding, they use decode_req_* states,
+        # NOT "prefill_current".
         state.reset()
-    else:
+        state._entered_decode = False
+        # Clean up stale multi-request decode states.
+        for rid in list(vllm_state.slot_manager._slots.keys()):
+            if rid.startswith("decode_req_"):
+                vllm_state.release_state(rid)
+    elif state is None:
         state = vllm_state.get_or_create_state(request_id)
-
-    # Also clean up stale multi-request decode states from prior batches.
-    for rid in list(vllm_state.slot_manager._slots.keys()):
-        if rid.startswith("decode_req_"):
-            vllm_state.release_state(rid)
 
     # Reshape from vLLM (T, H, D) to TQ (H, T, D)
     k, v = _reshape_kv(key[:num_tokens], value[:num_tokens], vllm_state.layer_info)
@@ -501,24 +505,24 @@ def _handle_decode_capture(
 
     if num_tokens > 1:
         # Multi-request decode: each token belongs to a different request.
-        # Process each token individually with per-request states.
+        # Each request gets its own "decode_req_{si}" state.
+        # Do NOT fall back to "prefill_current" — that state belongs to
+        # whichever request prefilled last. Using it for a different
+        # request would cause KV data pollution.
         for si in range(num_tokens):
             request_id = f"decode_req_{si}"
             state = vllm_state.get_state(request_id)
             if state is None:
-                # For si=0, try "prefill_current" (created during first
-                # request's prefill).
-                if si == 0:
-                    state = vllm_state.get_state("prefill_current")
-                if state is None:
-                    state = vllm_state.get_or_create_state(request_id)
+                state = vllm_state.get_or_create_state(request_id)
             k, v = _reshape_kv(key[si:si+1], value[si:si+1], vllm_state.layer_info)
             state.capture_engine.ingest_decode(k, v)
             state.num_tokens += 1
     else:
-        # Single request
+        # Single request decode — use "prefill_current" state.
         request_id = "prefill_current"
         state = vllm_state.get_state(request_id)
+        if state is not None:
+            state._entered_decode = True
         if state is None:
             state = vllm_state.get_or_create_state("decode_default")
         k, v = _reshape_kv(key[:num_tokens], value[:num_tokens], vllm_state.layer_info)
@@ -586,11 +590,11 @@ def _multi_seq_decode(
     )
 
     for si in range(num_reqs):
-        # Match the state lookup logic from _handle_decode_capture
+        # Only use dedicated per-request states.
+        # Do NOT fall back to "prefill_current" — it belongs to
+        # a different request and would cause KV data pollution.
         request_id = f"decode_req_{si}"
         state = vllm_state.get_state(request_id)
-        if state is None and si == 0:
-            state = vllm_state.get_state("prefill_current")
 
         if state is None or state.store.n_stored == 0:
             # No TQ data — keep the original attention result
