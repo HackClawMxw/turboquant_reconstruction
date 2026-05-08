@@ -363,10 +363,19 @@ class VllmAdapter(FrameworkAdapter):
 # ── Patched forward ────────────────────────────────────────────────────
 
 def _make_patched_forward(orig_fn, vllm_state: VllmLayerState, no_alloc: bool):
-    """Create patched attention forward that uses TurboQuant for decode."""
+    """Create patched attention forward that uses TurboQuant for decode.
+
+    NOTE: The patched function is assigned as ``impl.forward = patched``,
+    which makes it a plain function (NOT a bound method).  Therefore the
+    signature must match the way vLLM *calls* impl.forward — without an
+    explicit ``self_impl`` parameter.  ``orig_fn`` IS a bound method, so
+    calling it does not require passing the impl object either.
+    """
+
+    # Extract impl reference from the bound method for _prefill_attention_sdpa
+    impl_ref = getattr(orig_fn, '__self__', None)
 
     def patched(
-        self_impl,
         layer,
         query,
         key,
@@ -391,12 +400,12 @@ def _make_patched_forward(orig_fn, vllm_state: VllmLayerState, no_alloc: bool):
             _handle_prefill(vllm_state, key, value, attn_metadata, no_alloc)
             if no_alloc:
                 result = _prefill_attention_sdpa(
-                    vllm_state, self_impl, query, key, value, attn_metadata
+                    vllm_state, impl_ref, query, key, value, attn_metadata
                 )
                 _write_result(result, output, vllm_state.layer_info, attn_metadata)
                 return output
             return orig_fn(
-                self_impl, layer, query, key, value, kv_cache,
+                layer, query, key, value, kv_cache,
                 attn_metadata, output, output_scale, output_block_scale,
             )
 
@@ -411,7 +420,7 @@ def _make_patched_forward(orig_fn, vllm_state: VllmLayerState, no_alloc: bool):
                 # Multi-sequence decode: compute per-request TQ attention
                 return _multi_seq_decode(
                     vllm_state, query, num_actual, num_reqs,
-                    attn_metadata, output, orig_fn, self_impl,
+                    attn_metadata, output, orig_fn,
                     layer, key, value, kv_cache,
                     output_scale, output_block_scale,
                 )
@@ -419,14 +428,14 @@ def _make_patched_forward(orig_fn, vllm_state: VllmLayerState, no_alloc: bool):
                 # Single-sequence decode
                 return _single_seq_decode(
                     vllm_state, query, num_actual, attn_metadata,
-                    output, orig_fn, self_impl,
+                    output, orig_fn,
                     layer, key, value, kv_cache,
                     output_scale, output_block_scale,
                 )
 
         # ── Fallback: no metadata or profiling ──
         return orig_fn(
-            self_impl, layer, query, key, value, kv_cache,
+            layer, query, key, value, kv_cache,
             attn_metadata, output, output_scale, output_block_scale,
         )
 
@@ -499,7 +508,7 @@ def _single_seq_decode(
     num_actual: int,
     attn_metadata,
     output,
-    orig_fn, self_impl, layer, key, value, kv_cache,
+    orig_fn, layer, key, value, kv_cache,
     output_scale, output_block_scale,
 ):
     """Single-sequence TQ decode attention."""
@@ -511,7 +520,7 @@ def _single_seq_decode(
     if state is None or state.store.n_stored == 0:
         # No compressed data yet — fallback to original
         return orig_fn(
-            self_impl, layer, query, key, value, kv_cache,
+            layer, query, key, value, kv_cache,
             attn_metadata, output, output_scale, output_block_scale,
         )
 
@@ -534,7 +543,7 @@ def _multi_seq_decode(
     num_reqs: int,
     attn_metadata,
     output,
-    orig_fn, self_impl, layer, key, value, kv_cache,
+    orig_fn, layer, key, value, kv_cache,
     output_scale, output_block_scale,
 ):
     """Multi-sequence TQ decode attention."""
@@ -638,11 +647,14 @@ def _reshape_kv(
 
 
 def _make_patched_kv_update(orig_fn, no_alloc: bool):
-    """Patch KV cache update — skip when no_alloc."""
+    """Patch KV cache update — skip when no_alloc.
 
-    def patched(self_impl, layer, key, value, kv_cache, slot_mapping):
+    Same binding issue as _make_patched_forward: assigned as plain function.
+    """
+
+    def patched(layer, key, value, kv_cache, slot_mapping):
         if not no_alloc:
-            orig_fn(self_impl, layer, key, value, kv_cache, slot_mapping)
+            orig_fn(layer, key, value, kv_cache, slot_mapping)
 
     return patched
 
