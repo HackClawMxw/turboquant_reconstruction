@@ -261,7 +261,7 @@ def _tq_fused_decode_kernel(
                     sign_bit = (packed >> bit) & 1
                     sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
                     qs_val = tl.load(Q_SKETCH_ptr + pid_q * stride_q_qh + coord_idx * stride_q_d).to(tl.float32)
-                qjl_dot += qs_val * sign_val
+                    qjl_dot += qs_val * sign_val
 
         res_norms = tl.load(
             RES_NORMS_ptr + pid_kv * stride_rn_kv + n_offs * stride_rn_n,
