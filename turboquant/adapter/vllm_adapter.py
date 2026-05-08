@@ -414,12 +414,12 @@ def _make_patched_forward(orig_fn, vllm_state: VllmLayerState, no_alloc: bool):
             _handle_decode_capture(vllm_state, key, value, attn_metadata)
 
             num_actual = getattr(attn_metadata, 'num_actual_tokens', query.shape[0])
-            num_reqs = getattr(attn_metadata, 'num_reqs', None)
 
-            if num_reqs is not None and num_reqs > 1:
-                # Multi-sequence decode: compute per-request TQ attention
+            # In vLLM decode mode, each token is a separate request.
+            # num_actual > 1 means multiple concurrent requests.
+            if num_actual > 1:
                 return _multi_seq_decode(
-                    vllm_state, query, num_actual, num_reqs,
+                    vllm_state, query, num_actual, num_actual,
                     attn_metadata, output, orig_fn,
                     layer, key, value, kv_cache,
                     output_scale, output_block_scale,
@@ -479,15 +479,26 @@ def _handle_decode_capture(
 
     Uses KVCaptureEngine.ingest_decode which writes to ring buffer
     and automatically compresses overflow to the store.
+
+    In decode mode, each token belongs to a different request.
+    When num_tokens > 1, we process each token separately with
+    its own capture state.
     """
     num_tokens = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
-    num_reqs = getattr(attn_metadata, 'num_reqs', None)
 
-    if num_reqs is not None and num_reqs > 1:
-        # Multi-request: each token goes to its own request's capture engine
-        for si in range(min(num_tokens, num_reqs)):
-            request_id = f"req_{si}"
-            state = vllm_state.get_or_create_state(request_id)
+    if num_tokens > 1:
+        # Multi-request decode: each token belongs to a different request.
+        # Process each token individually with per-request states.
+        for si in range(num_tokens):
+            request_id = f"decode_req_{si}"
+            state = vllm_state.get_state(request_id)
+            if state is None:
+                # For si=0, try "prefill_current" (created during first
+                # request's prefill).
+                if si == 0:
+                    state = vllm_state.get_state("prefill_current")
+                if state is None:
+                    state = vllm_state.get_or_create_state(request_id)
             k, v = _reshape_kv(key[si:si+1], value[si:si+1], vllm_state.layer_info)
             state.capture_engine.ingest_decode(k, v)
             state.num_tokens += 1
@@ -546,26 +557,41 @@ def _multi_seq_decode(
     orig_fn, layer, key, value, kv_cache,
     output_scale, output_block_scale,
 ):
-    """Multi-sequence TQ decode attention."""
+    """Multi-sequence TQ decode attention.
+
+    Each of the num_reqs tokens belongs to a different request.
+    First runs original attention for all sequences (safe baseline),
+    then overwrites with TQ results for sequences that have compressed data.
+    """
+    info = vllm_state.layer_info
+
+    # Run original attention for ALL sequences as baseline.
+    # This ensures sequences without TQ state get correct results.
+    orig_fn(
+        layer, query, key, value, kv_cache,
+        attn_metadata, output, output_scale, output_block_scale,
+    )
+
     for si in range(num_reqs):
-        request_id = f"req_{si}"
+        # Match the state lookup logic from _handle_decode_capture
+        request_id = f"decode_req_{si}"
         state = vllm_state.get_state(request_id)
+        if state is None and si == 0:
+            state = vllm_state.get_state("prefill_current")
 
         if state is None or state.store.n_stored == 0:
-            # Skip — no data for this request
-            if output is not None:
-                output[si:si+1].zero_()
+            # No TQ data — keep the original attention result
             continue
 
+        # Compute TQ attention and overwrite
         q = query[si:si+1]
         if q.dim() == 2:
-            q = q.view(1, vllm_state.layer_info.num_query_heads, vllm_state.layer_info.head_dim)
+            q = q.view(1, info.num_query_heads, info.head_dim)
         q = q.squeeze(0)  # (QH, D)
 
         result = vllm_state.attention_engine.compute_decode_attention(q, state)
 
         # Write per-sequence result
-        info = vllm_state.layer_info
         result_flat = result.reshape(1, info.num_query_heads * info.head_dim)
         if output is not None:
             out_slice = output[si:si+1]

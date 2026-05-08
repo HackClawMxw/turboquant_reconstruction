@@ -116,23 +116,20 @@ class KVCaptureEngine:
         Append decode tokens. Handles ring buffer overflow automatically.
 
         Args:
-            key: (H_kv, 1, D) or (1, H_kv, D) single token
+            key: (H_kv, T, D) from _reshape_kv (always transposed format)
             value: same shape as key
         """
-        # Normalize to (1, H_kv, D) for ring buffer
-        if key.dim() == 3 and key.shape[0] == key.shape[1]:
-            # (H_kv, 1, D) -> (1, H_kv, D)
-            key_rb = key.transpose(0, 1)
-            value_rb = value.transpose(0, 1)
-        else:
-            key_rb = key
-            value_rb = value
+        # _reshape_kv always outputs (H_kv, T, D).
+        # Ring buffer expects (T, H_kv, D) — always transpose.
+        key_rb = key.transpose(0, 1)
+        value_rb = value.transpose(0, 1)
 
         overflow_key, overflow_value = self.ring_buffer.write(key_rb, value_rb)
 
         if overflow_key is not None:
-            # Compress the overflowed token(s)
-            overflow_key_q = overflow_key.transpose(0, 1)  # (H_kv, 1, D)
+            # overflow is (n_overflow, H_kv, D) from ring buffer.
+            # Store expects (H_kv, n_overflow, D) — transpose back.
+            overflow_key_q = overflow_key.transpose(0, 1)
             overflow_value_q = overflow_value.transpose(0, 1)
             self.store.append_chunk(overflow_key_q, overflow_value_q)
 
