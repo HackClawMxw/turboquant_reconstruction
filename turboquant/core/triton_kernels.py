@@ -118,7 +118,8 @@ def _tq_fused_score_kernel(
             if coord_idx < D:
                 idx = (packed >> (sub * BITS)) & BIT_MASK
                 centroid_val = tl.load(CENTROIDS_ptr + idx)
-                mse_scores += q_rot[coord_idx] * centroid_val
+                q_val = tl.load(Q_ROT_ptr + pid_q * stride_q_qh + coord_idx * stride_q_d).to(tl.float32)
+                mse_scores += q_val * centroid_val
 
     key_norms = tl.load(
         NORMS_ptr + pid_kv * stride_n_kv + n_offs * stride_n_n,
@@ -138,7 +139,8 @@ def _tq_fused_score_kernel(
             if coord_idx < D:
                 sign_bit = (packed >> bit) & 1
                 sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
-                qjl_dot += q_sketch[coord_idx] * sign_val
+                qs_val = tl.load(Q_SKETCH_ptr + pid_q * stride_q_qh + coord_idx * stride_q_d).to(tl.float32)
+                qjl_dot += qs_val * sign_val
 
     res_norms = tl.load(
         RES_NORMS_ptr + pid_kv * stride_rn_kv + n_offs * stride_rn_n,
@@ -237,7 +239,8 @@ def _tq_fused_decode_kernel(
                 if coord_idx < D:
                     idx = (packed >> (sub * BITS)) & BIT_MASK
                     centroid_val = tl.load(CENTROIDS_ptr + idx)
-                    mse_scores += q_rot[coord_idx] * centroid_val
+                    q_val = tl.load(Q_ROT_ptr + pid_q * stride_q_qh + coord_idx * stride_q_d).to(tl.float32)
+                    mse_scores += q_val * centroid_val
 
         key_norms = tl.load(
             NORMS_ptr + pid_kv * stride_n_kv + n_offs * stride_n_n,
@@ -257,7 +260,8 @@ def _tq_fused_decode_kernel(
                 if coord_idx < D:
                     sign_bit = (packed >> bit) & 1
                     sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
-                    qjl_dot += q_sketch[coord_idx] * sign_val
+                    qs_val = tl.load(Q_SKETCH_ptr + pid_q * stride_q_qh + coord_idx * stride_q_d).to(tl.float32)
+                qjl_dot += qs_val * sign_val
 
         res_norms = tl.load(
             RES_NORMS_ptr + pid_kv * stride_rn_kv + n_offs * stride_rn_n,
