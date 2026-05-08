@@ -119,13 +119,19 @@ class VllmAdapter(FrameworkAdapter):
                 logger.info(f"[TQ] Skipping MLA layer: {name}")
                 continue
 
-            head_dim = getattr(attn_module, 'head_size', None)
-            if head_dim is None:
-                head_dim = getattr(attn_module, 'head_dim', None)
-            if head_dim is None:
+            # head_size is on impl, not on attn_module (vLLM convention)
+            if hasattr(impl, "head_size"):
+                head_dim = int(impl.head_size)
+            elif hasattr(impl, "kv_lora_rank"):
+                head_dim = int(impl.kv_lora_rank)
+            else:
                 continue
 
-            num_kv_heads = int(impl.num_kv_heads)
+            num_kv_heads = getattr(impl, "num_kv_heads", None)
+            if num_kv_heads is None:
+                continue
+            num_kv_heads = int(num_kv_heads)
+
             num_query_heads = _infer_num_query_heads(attn_module, impl)
 
             layers.append(AttentionLayerInfo(
@@ -134,8 +140,11 @@ class VllmAdapter(FrameworkAdapter):
                 head_dim=head_dim,
                 num_kv_heads=num_kv_heads,
                 num_query_heads=num_query_heads,
-                device=next(attn_module.parameters()).device,
-                dtype=next(attn_module.parameters()).dtype,
+                device=model.device,
+                dtype=getattr(
+                    getattr(model, 'model_config', None),
+                    'dtype', torch.bfloat16,
+                ),
                 is_mla=False,
             ))
 
@@ -224,7 +233,7 @@ class VllmAdapter(FrameworkAdapter):
                     setattr(self.config, k, v)
 
         layers = self.discover_layers(model)
-        logger.info(f"[TQ] Discovered {len(layers)} attention layers")
+        print(f"[TurboQuant] Discovered {len(layers)} attention layers", flush=True)
 
         hooks = {}
         static_ctx = self._get_static_ctx(model)
@@ -295,7 +304,7 @@ class VllmAdapter(FrameworkAdapter):
 
         self._installed = True
         self._model = model
-        logger.info(f"[TQ] Installed hooks for {len(hooks)} layers")
+        print(f"[TurboQuant] Installed hooks for {len(hooks)} layers", flush=True)
 
         # Store layer states on model runner for external access
         model._tq_layer_states = self._layer_states
@@ -835,12 +844,18 @@ def enable_no_alloc(
                         attn.kv_sharing_target_layer_name = target
                         shared_layer_names.append(name)
 
+            print(
+                f"[TurboQuant] TQ layers: {len(tq_layer_names)}, "
+                f"shared: {len(shared_layer_names)}",
+                flush=True,
+            )
             return {"shared_layer_names": shared_layer_names}
 
         try:
             hooks = self.collective_rpc(_worker_install_tq)
-            logger.info("[TurboQuant] no_alloc hooks installed: %s", hooks)
+            print(f"[TurboQuant] collective_rpc OK: {hooks}", flush=True)
         except Exception as e:
+            print(f"[TurboQuant] collective_rpc FAILED: {e}", flush=True)
             logger.error("[TurboQuant] collective_rpc FAILED: %s", e, exc_info=True)
             return orig_get_specs(self)
 
@@ -855,9 +870,10 @@ def enable_no_alloc(
             for name in shared:
                 worker_specs.pop(name, None)
         if shared:
-            logger.info(
-                "[TurboQuant] Removed %d shared layer specs from KV cache "
-                "allocation (layers share one paged cache)", len(shared),
+            print(
+                f"[TurboQuant] Removed {len(shared)} shared layer specs "
+                f"(layers share one paged cache)",
+                flush=True,
             )
 
         return specs
