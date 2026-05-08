@@ -453,11 +453,24 @@ def _handle_prefill(
 
     Uses KVCaptureEngine.ingest_prefill which splits tokens:
     compress all but the last ring_capacity tokens, keep recent in ring buffer.
+
+    IMPORTANT: Resets the state before loading new prefill data to prevent
+    KV pollution from previous requests.
     """
     num_tokens = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
 
     request_id = "prefill_current"
-    state = vllm_state.get_or_create_state(request_id)
+    state = vllm_state.get_state(request_id)
+    if state is not None:
+        # Previous request's state exists — must reset to avoid KV pollution.
+        state.reset()
+    else:
+        state = vllm_state.get_or_create_state(request_id)
+
+    # Also clean up stale multi-request decode states from prior batches.
+    for rid in list(vllm_state.slot_manager._slots.keys()):
+        if rid.startswith("decode_req_"):
+            vllm_state.release_state(rid)
 
     # Reshape from vLLM (T, H, D) to TQ (H, T, D)
     k, v = _reshape_kv(key[:num_tokens], value[:num_tokens], vllm_state.layer_info)
