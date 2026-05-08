@@ -92,10 +92,22 @@ class VllmAdapter(FrameworkAdapter):
 
     # ── FrameworkAdapter interface ──────────────────────────────────────
 
+    @staticmethod
+    def _get_static_ctx(model) -> dict:
+        """Resolve static_forward_context across vLLM versions.
+
+        v0.18.0+: model.compilation_config.static_forward_context
+        Older:    model.static_forward_context
+        """
+        cfg = getattr(model, 'compilation_config', None)
+        if cfg is not None:
+            return getattr(cfg, 'static_forward_context', {})
+        return getattr(model, 'static_forward_context', {})
+
     def discover_layers(self, model: Any) -> list[AttentionLayerInfo]:
         """Discover attention layers from vLLM model runner."""
         layers = []
-        static_ctx = getattr(model, 'static_forward_context', {})
+        static_ctx = self._get_static_ctx(model)
 
         for idx, (name, attn_module) in enumerate(static_ctx.items()):
             impl = getattr(attn_module, 'impl', None)
@@ -215,7 +227,7 @@ class VllmAdapter(FrameworkAdapter):
         logger.info(f"[TQ] Discovered {len(layers)} attention layers")
 
         hooks = {}
-        static_ctx = getattr(model, 'static_forward_context', {})
+        static_ctx = self._get_static_ctx(model)
 
         for layer_info in layers:
             # Create per-layer state
@@ -804,7 +816,7 @@ def enable_no_alloc(
             # This reduces KV cache allocation from N layers to 1.
             # KV capture is done in patched forward, so skipping
             # do_kv_cache_update for shared layers is safe.
-            static_ctx = worker.model_runner.static_forward_context
+            static_ctx = VllmAdapter._get_static_ctx(worker.model_runner)
             tq_layer_names = list(adapter._layer_states.keys())
             shared_layer_names = []
 
