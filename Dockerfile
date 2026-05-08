@@ -1,6 +1,7 @@
 FROM vllm/vllm-openai:v0.18.0
 
-COPY ./turboquant /opt/turboquant
+COPY ./turboquant /opt/turboquant/turboquant
+COPY setup.py /opt/turboquant/setup.py
 WORKDIR /opt/turboquant
 
 RUN pip config --user set global.index https://mirrors.tools.huawei.com/pypi && \
