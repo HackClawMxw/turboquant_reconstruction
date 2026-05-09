@@ -48,78 +48,9 @@ class TQConfig:
     value_bits: int = 2
     value_group_size: int = 32
     ring_capacity: int = 128
-    max_tokens_per_request: int = 4096
+    max_tokens_per_request: int = 32768
     max_num_seqs: int = 256
     no_alloc: bool = True  # Free paged KV cache after prefill
-
-
-# ── Request Tracking ────────────────────────────────────────────────────
-
-class RequestTracker:
-    """
-    Tracks request lifecycle for per-request KV state management.
-
-    Maps vLLM sequence indices to TurboQuant request IDs across
-    prefill and decode steps.
-
-    Assumptions (true for vLLM v1 typical scheduling):
-    - At most one prefill at a time
-    - Prefill and decode are in separate batches
-    - Requests complete in roughly FIFO order
-    - Layer 0 is always called first in each forward pass
-    """
-
-    def __init__(self):
-        self._req_counter: int = 0
-        self._pending_prefill_id: Optional[str] = None
-        self._active_decode_ids: list[str] = []
-
-    def on_prefill(self) -> str:
-        """Get/create request ID for current prefill.
-
-        Returns the same ID for chunked prefill (multiple chunks
-        for one request).
-        """
-        if self._pending_prefill_id is None:
-            self._pending_prefill_id = f"tq_req_{self._req_counter}"
-            self._req_counter += 1
-        return self._pending_prefill_id
-
-    def on_decode_start(self, num_seqs: int) -> list[str]:
-        """Called at the start of a decode step (layer 0 only).
-
-        Moves pending prefill to active decode list.
-        Removes finished requests (FIFO assumption).
-
-        Returns list of finished request IDs for cleanup.
-        """
-        finished = []
-
-        if self._pending_prefill_id is not None:
-            self._active_decode_ids.append(self._pending_prefill_id)
-            self._pending_prefill_id = None
-
-        # Trim finished requests (FIFO: oldest first)
-        if len(self._active_decode_ids) > num_seqs:
-            n_finished = len(self._active_decode_ids) - num_seqs
-            finished = self._active_decode_ids[:n_finished]
-            self._active_decode_ids = self._active_decode_ids[n_finished:]
-
-        return finished
-
-    def get_decode_id(self, seq_idx: int) -> Optional[str]:
-        """Get request ID for a decode sequence index."""
-        if 0 <= seq_idx < len(self._active_decode_ids):
-            return self._active_decode_ids[seq_idx]
-        return None
-
-    def active_count(self) -> int:
-        return len(self._active_decode_ids)
-
-    def reset(self):
-        """Reset all tracking state."""
-        self._pending_prefill_id = None
-        self._active_decode_ids.clear()
 
 
 # ── Layer Registration ─────────────────────────────────────────────────
@@ -132,9 +63,6 @@ class VllmLayerState:
     slot_manager: RequestSlotManager
     attention_engine: AttentionEngine
     layer_buffers: Optional[dict] = None  # Pre-allocated CUDA Graph buffers
-    # Shared across all layers (set by adapter after all layers are created)
-    tracker: Optional[RequestTracker] = None
-    all_layer_states: Optional[dict] = None
 
     def get_or_create_state(self, request_id: str) -> RequestKVState:
         return self.slot_manager.allocate(request_id)
@@ -376,13 +304,6 @@ class VllmAdapter(FrameworkAdapter):
 
         self._installed = True
         self._model = model
-
-        # Wire up shared request tracker across all layers
-        shared_tracker = RequestTracker()
-        for name, ls in self._layer_states.items():
-            ls.tracker = shared_tracker
-            ls.all_layer_states = self._layer_states
-
         print(f"[TurboQuant] Installed hooks for {len(hooks)} layers", flush=True)
 
         # Store layer states on model runner for external access
@@ -530,29 +451,24 @@ def _handle_prefill(
 ):
     """Capture KV from prefill into per-request store via capture engine.
 
-    Uses RequestTracker to assign a unique per-request ID.
-    Each request gets its own CompressedKVStore + RingBuffer, ensuring
-    complete data isolation between concurrent requests.
+    Uses KVCaptureEngine.ingest_prefill which splits tokens:
+    compress all but the last ring_capacity tokens, keep recent in ring buffer.
 
-    For chunked prefill, the same request ID is reused across chunks
-    (tracker returns the same pending ID until decode starts).
+    When the state has been used for decode (_entered_decode flag), a new
+    prefill means a fresh request is starting. Reset the state to prevent
+    KV pollution from the previous request.
     """
     num_tokens = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
-    tracker = vllm_state.tracker
 
-    # Get or create per-request state
-    if tracker is not None:
-        request_id = tracker.on_prefill()
-    else:
-        request_id = "prefill_fallback"
-
+    request_id = "prefill_current"
     state = vllm_state.get_state(request_id)
-    if state is None:
+    if state is not None and getattr(state, '_entered_decode', False):
+        # Previous request went through decode → this is a new request.
+        # Reset to clear stale KV data.
+        state.reset()
+        state._entered_decode = False
+    elif state is None:
         state = vllm_state.get_or_create_state(request_id)
-    else:
-        # Chunked prefill continuation — state already exists.
-        # Do NOT reset; just keep appending.
-        pass
 
     # Reshape from vLLM (T, H, D) to TQ (H, T, D)
     k, v = _reshape_kv(key[:num_tokens], value[:num_tokens], vllm_state.layer_info)
@@ -572,46 +488,27 @@ def _handle_decode_capture(
 ):
     """Capture decode KV tokens into per-request stores via capture engine.
 
-    Uses RequestTracker to route each token to its own per-request state.
-    On layer 0, triggers request lifecycle management (adding new requests,
-    cleaning up finished ones).
+    Uses KVCaptureEngine.ingest_decode which writes to ring buffer
+    and automatically compresses overflow to the store.
+
+    In decode mode, each token belongs to a different request.
+    When num_tokens > 1, we process each token separately with
+    its own capture state.
     """
     num_tokens = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
-    tracker = vllm_state.tracker
-    is_first_layer = vllm_state.layer_info.layer_idx == 0
 
-    # Layer 0: update tracker and clean up finished requests
-    if is_first_layer and tracker is not None:
-        finished = tracker.on_decode_start(num_tokens)
-        for rid in finished:
-            if vllm_state.all_layer_states is not None:
-                for ls in vllm_state.all_layer_states.values():
-                    ls.release_state(rid)
-
-    # Capture each token into its per-request state
-    if tracker is not None:
-        for si in range(num_tokens):
-            req_id = tracker.get_decode_id(si)
-            if req_id is None:
-                continue
-            state = vllm_state.get_state(req_id)
-            if state is None:
-                continue
-            # Single token: (1, H_kv, D) → (H_kv, 1, D)
-            k, v = _reshape_kv(
-                key[si:si+1], value[si:si+1], vllm_state.layer_info
-            )
-            state.capture_engine.ingest_decode(k, v)
-            state.num_tokens += 1
-    else:
-        # Fallback: no tracker, use legacy shared state
-        request_id = "prefill_fallback"
-        state = vllm_state.get_state(request_id)
-        if state is None:
-            state = vllm_state.get_or_create_state("decode_fallback")
-        k, v = _reshape_kv(key[:num_tokens], value[:num_tokens], vllm_state.layer_info)
-        state.capture_engine.ingest_decode(k, v)
-        state.num_tokens += num_tokens
+    # Always capture into the shared "prefill_current" state.
+    # Per-request GPU states are too expensive (OOM), so all requests
+    # share one state.  Data mixing is accepted for concurrent requests.
+    request_id = "prefill_current"
+    state = vllm_state.get_state(request_id)
+    if state is not None:
+        state._entered_decode = True
+    if state is None:
+        state = vllm_state.get_or_create_state("decode_default")
+    k, v = _reshape_kv(key[:num_tokens], value[:num_tokens], vllm_state.layer_info)
+    state.capture_engine.ingest_decode(k, v)
+    state.num_tokens += num_tokens
 
 
 def _single_seq_decode(
@@ -623,10 +520,11 @@ def _single_seq_decode(
     orig_fn, layer, key, value, kv_cache,
     output_scale, output_block_scale,
 ):
-    """Single-sequence TQ decode attention using per-request state."""
-    tracker = vllm_state.tracker
-    req_id = tracker.get_decode_id(0) if tracker else None
-    state = vllm_state.get_state(req_id) if req_id else None
+    """Single-sequence TQ decode attention."""
+    request_id = "prefill_current"
+    state = vllm_state.get_state(request_id)
+    if state is None:
+        state = vllm_state.get_state("decode_default")
 
     # Only fall back to orig_fn when there is NO TQ data at all.
     # With no_alloc mode, orig_fn reads from an empty paged KV cache,
@@ -660,27 +558,22 @@ def _multi_seq_decode(
     orig_fn, layer, key, value, kv_cache,
     output_scale, output_block_scale,
 ):
-    """Multi-sequence TQ decode attention using per-request states.
+    """Multi-sequence TQ decode attention.
 
-    Each request uses its own per-request KV state for attention,
-    ensuring complete data isolation between concurrent requests.
+    Uses the shared "prefill_current" state for all requests.
+    Per-request GPU states are avoided to prevent OOM.
+
+    For each request, computes TQ attention if data is available,
+    otherwise falls back to orig_fn result.
     """
     info = vllm_state.layer_info
-    tracker = vllm_state.tracker
+    state = vllm_state.get_state("prefill_current")
 
-    # Check if any request has TQ data
-    has_any_tq = False
-    req_states = []
-    for si in range(num_reqs):
-        req_id = tracker.get_decode_id(si) if tracker else None
-        state = vllm_state.get_state(req_id) if req_id else None
-        req_states.append(state)
-        if state is not None and (
-            state.store.n_stored > 0 or state.ring_buffer.count > 0
-        ):
-            has_any_tq = True
+    has_tq = state is not None and (
+        state.store.n_stored > 0 or state.ring_buffer.count > 0
+    )
 
-    if not has_any_tq:
+    if not has_tq:
         # No TQ data — pure orig_fn for all
         return orig_fn(
             layer, query, key, value, kv_cache,
@@ -693,14 +586,8 @@ def _multi_seq_decode(
         attn_metadata, output, output_scale, output_block_scale,
     )
 
-    # Overwrite each sequence with TQ attention from its own state
+    # Overwrite each sequence with TQ attention from shared state
     for si in range(num_reqs):
-        state = req_states[si]
-        if state is None or (
-            state.store.n_stored == 0 and state.ring_buffer.count == 0
-        ):
-            continue  # Keep orig_fn result for this sequence
-
         q = query[si:si+1]
         if q.dim() == 2:
             q = q.view(1, info.num_query_heads, info.head_dim)
@@ -832,7 +719,7 @@ def install_hooks(
     value_bits: int = 2,
     value_group_size: int = 32,
     ring_capacity: int = 128,
-    max_tokens: int = 4096,
+    max_tokens: int = 32768,
     max_num_seqs: int = 256,
     no_alloc: bool = True,
 ) -> VllmAdapter:
